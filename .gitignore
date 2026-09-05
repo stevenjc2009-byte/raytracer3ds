@@ -1,0 +1,10 @@
+# devkitPro build output
+build/
+*.3dsx
+*.elf
+*.smdh
+*.cia
+*.bnr
+
+# stray dirs produced when the template Makefile is run from a path with a space
+u/
