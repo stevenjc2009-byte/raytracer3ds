@@ -46,7 +46,7 @@
 /* Updater. APP_VERSION is compared against the tag of the latest GitHub
  * release -- bump it whenever a new release is cut, or the app will offer to
  * install a build it is already running. */
-#define APP_VERSION "1.0.2"
+#define APP_VERSION "1.0.3"
 #define UPDATE_LATEST_URL \
 	"https://github.com/stevenjc2009-byte/raytracer3ds/releases/latest"
 #define UPDATE_CIA_URL \
@@ -122,6 +122,26 @@ static inline Vec3 v_lerp(Vec3 a, Vec3 b, float t)
 static inline float clampf(float v, float lo, float hi)
 {
 	return (v < lo) ? lo : (v > hi) ? hi : v;
+}
+
+/*
+ * floor(), as an int, without calling libm.
+ *
+ * Every use of floor() in this program immediately truncates to int for a
+ * checkerboard parity test, so the float result was never wanted. floorf() is a
+ * real function call on this toolchain -- and the disassembly showed four of
+ * them inside trace(), the hottest function in the program.
+ *
+ * A C float->int cast truncates toward zero, which is already floor() for
+ * non-negative x and exactly one too high for negative non-integer x. Taking
+ * the comparison as 0 or 1 corrects that branchlessly, and the whole thing is
+ * one vcvt plus a compare. The result is bit-identical to (int)floorf(x) for
+ * every value that fits in an int, which is the entire visible scene.
+ */
+static inline int ifloor(float x)
+{
+	const int i = (int)x;
+	return i - (x < (float)i);
 }
 
 /*
@@ -292,7 +312,7 @@ static Vec3 cube_face_color(Vec3 p, Vec3 n)
 		v = p.y;
 	}
 
-	const int cell = (int)floorf(u * 4.0f) + (int)floorf(v * 4.0f);
+	const int cell = ifloor(u * 4.0f) + ifloor(v * 4.0f);
 	return ((cell & 1) == 0) ? CUBE_TINT_A : CUBE_TINT_B;
 }
 
@@ -327,7 +347,7 @@ static int scene_intersect(Vec3 ro, Vec3 rd, float t_min, float t_max, Hit *h)
 		h->p = v_add(ro, v_scale(rd, t));
 		h->n = v3(0.0f, (rd.y < 0.0f) ? 1.0f : -1.0f, 0.0f);
 
-		const int cell = (int)floorf(h->p.x) + (int)floorf(h->p.z);
+		const int cell = ifloor(h->p.x) + ifloor(h->p.z);
 		h->albedo = ((cell & 1) == 0) ? PLANE_LIGHT : PLANE_DARK;
 		h->refl_tint = PLANE_REFL_TINT;
 
@@ -406,8 +426,21 @@ static Vec3 shade_direct(const Hit *h, Vec3 view_dir)
 	const Vec3 light_refl = v_reflect(v_scale(LIGHT_DIR, -1.0f), h->n);
 	const float r_dot_v = v_dot(light_refl, v_scale(view_dir, -1.0f));
 	if (r_dot_v > 0.0f) {
-		const float s = powi(r_dot_v, h->shininess) * h->spec;
-		color = v_add(color, v_scale(LIGHT_COLOR, s));
+		/*
+		 * Dispatching on the two shininess values the scene actually has,
+		 * rather than passing h->shininess straight through, is what lets
+		 * powi() unroll. With a runtime exponent it stays a real loop --
+		 * eight iterations of test/multiply/square/shift in the hottest
+		 * function in the program; with a constant it folds to a
+		 * straight-line chain of vmul.f32. Same arithmetic either way.
+		 *
+		 * Adding a third material means adding a case here, or the specular
+		 * highlight silently takes the plane's exponent.
+		 */
+		const float p = (h->shininess == CUBE_SHININESS)
+		                        ? powi(r_dot_v, CUBE_SHININESS)
+		                        : powi(r_dot_v, PLANE_SHININESS);
+		color = v_add(color, v_scale(LIGHT_COLOR, p * h->spec));
 	}
 
 	return color;
@@ -421,6 +454,18 @@ static Vec3 trace(Vec3 ro, Vec3 rd, int depth)
 {
 	Hit h;
 	if (!scene_intersect(ro, rd, RAY_EPS, FAR_T, &h))
+		return sky_color(rd);
+
+	/*
+	 * Past FADE_END the distance fade below is a full replacement by the sky,
+	 * so everything that would be computed for this hit -- the shadow ray, the
+	 * Phong terms, and an entire recursive reflection -- is discarded. Return
+	 * the sky now instead of computing all of it and then throwing it away.
+	 *
+	 * This is the same test the fade itself uses, so it cannot disagree with
+	 * it: whenever this fires, the fade factor would have been exactly 1.
+	 */
+	if (fabsf(h.n.y) > 0.5f && h.t >= FADE_END)
 		return sky_color(rd);
 
 	Vec3 color = shade_direct(&h, rd);
@@ -637,6 +682,17 @@ static int g_worker_prio = 0x30;         /* overwritten with the real value */
 static u8 g_cores[MAX_RENDER_THREADS];   /* g_cores[0] is always core 0     */
 static Result g_worker_cache_rc = 0;     /* first cache-clean failure, if any */
 
+/*
+ * Why core acquisition went the way it did. v1.0.2 reported "cores: 2" on a New
+ * 3DS, where 3 was expected, and there was no way to tell from the screen which
+ * of the two conditions failed -- core 1's time-limit request, or the New 3DS
+ * check for core 2. Both produce exactly the same count. These record the real
+ * answer so the next run reports it instead of leaving it to be guessed at.
+ */
+static Result g_apt_rc = 0;              /* last APT_SetAppCpuTimeLimit result */
+static int g_apt_limit = 0;              /* the limit that worked, else 0      */
+static int g_new3ds = 0;                 /* what the New 3DS check returned    */
+
 typedef struct {
 	u8 *fb;
 	const Camera *cam;
@@ -687,13 +743,30 @@ static void threads_init(void)
 	g_cores[0] = 0; /* this thread */
 	g_max_threads = 1;
 
-	if (R_SUCCEEDED(APT_SetAppCpuTimeLimit(SYSCORE_TIME_LIMIT)))
-		g_cores[g_max_threads++] = 1;
+	/*
+	 * Ask for the system core. A single fixed percentage is not reliable --
+	 * the OS refuses some values depending on the title and the APT state --
+	 * so try the usual ones from most to least greedy and take the first that
+	 * is granted. Each is a request for a share of core 1, so a smaller one
+	 * still yields a usable core; only an outright refusal of all of them
+	 * loses it. This can add a core, never remove one.
+	 */
+	static const u32 limits[] = { SYSCORE_TIME_LIMIT, 70, 50, 30 };
+
+	for (unsigned i = 0; i < sizeof(limits) / sizeof(limits[0]); i++) {
+		g_apt_rc = APT_SetAppCpuTimeLimit(limits[i]);
+		if (R_SUCCEEDED(g_apt_rc)) {
+			g_apt_limit = (int)limits[i];
+			g_cores[g_max_threads++] = 1;
+			break;
+		}
+	}
 
 	/* Asking is cheap and threadCreate failing is handled below, so this
 	 * does not also try to detect the exheader flag -- a .3dsx on a New 3DS
 	 * will simply fail to start the thread and fall back. */
-	if (is_new_3ds() && g_max_threads < MAX_RENDER_THREADS)
+	g_new3ds = is_new_3ds();
+	if (g_new3ds && g_max_threads < MAX_RENDER_THREADS)
 		g_cores[g_max_threads++] = 2;
 }
 
@@ -1145,10 +1218,17 @@ static void write_bench_report(void)
 	}
 
 	fprintf(f, "raytracer3ds v%s benchmark\n", APP_VERSION);
-	fprintf(f, "console: %s\n", is_new_3ds() ? "New 3DS" : "Old 3DS");
+	fprintf(f, "console: %s\n", g_new3ds ? "New 3DS" : "Old 3DS");
 	fprintf(f, "screen : %dx%d\n", SCREEN_W, SCREEN_H);
-	fprintf(f, "cores  : %d usable (core 1 capped at %d%%)\n",
-	        g_max_threads, SYSCORE_TIME_LIMIT);
+	fprintf(f, "cores  : %d usable [", g_max_threads);
+	for (int i = 0; i < g_max_threads; i++)
+		fprintf(f, "%s%d", i ? " " : "", (int)g_cores[i]);
+	fprintf(f, "]\n");
+	if (g_apt_limit)
+		fprintf(f, "syscore: granted at %d%%\n", g_apt_limit);
+	else
+		fprintf(f, "syscore: REFUSED, last rc 0x%08lX (core 1 unavailable)\n",
+		        (unsigned long)g_apt_rc);
 	fprintf(f, "target : 50.0 ms for 20 fps\n\n");
 	fprintf(f, "%-16s %10s %8s %4s %10s\n",
 	        "config", "ms", "fps", "thr", "rays");
@@ -1248,7 +1328,18 @@ int main(int argc, char **argv)
 	printf("%dx%d  %dx%d AA  %d bounces\n",
 	       SCREEN_W, SCREEN_H, AA, AA, MAX_DEPTH);
 	printf("console: %s   cores: %d\n",
-	       is_new_3ds() ? "New 3DS" : "Old 3DS", g_max_threads);
+	       g_new3ds ? "New 3DS" : "Old 3DS", g_max_threads);
+
+	/* Which cores, and why -- so a missing core says which check refused it
+	 * rather than leaving the count to be interpreted. */
+	printf("cores:");
+	for (int i = 0; i < g_max_threads; i++)
+		printf(" %d", (int)g_cores[i]);
+	if (g_apt_limit)
+		printf("  syscore %d%%\n", g_apt_limit);
+	else
+		printf("  syscore REFUSED 0x%08lX\n", (unsigned long)g_apt_rc);
+
 	printf("\nSTART   exit\n");
 	printf("Y       check for updates\n");
 	printf("SELECT  run benchmark\n");

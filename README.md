@@ -37,7 +37,7 @@ columns `i, i+N, i+2N, …`. The bottom screen prints how many cores were acquir
 | Core | Availability | How it is obtained |
 | --- | --- | --- |
 | 0 | always | the app core |
-| 1 | always | `APT_SetAppCpuTimeLimit(80)` — 80% of the system core |
+| 1 | always | `APT_SetAppCpuTimeLimit()` — 80/70/50/30% requested in turn until one is granted (v1.0.3; see [Hot-path optimisations](#hot-path-optimisations-v103)) |
 | 2 | New 3DS only | exheader kernel flag `0x2000`, set by `CanAccessCore2` in the RSF |
 
 Core 2 is therefore **CIA-only**: a `.3dsx` under the Homebrew Launcher has no
@@ -50,9 +50,10 @@ Two things about this design are deliberate:
   threads ever share a cache line. Row-interleaving would put every thread in the
   same line on every single pixel.
 - **Static split, no work stealing.** It needs zero cross-core synchronisation and
-  has no failure mode that can corrupt the image. Core 1 is throttled to 80% and
-  so finishes late; rather than guess a weighting to correct for that, the
-  benchmark measures the real x1/x2/x3 scaling on the console.
+  has no failure mode that can corrupt the image. Core 1 is throttled (v1.0.3
+  requests 80/70/50/30% in turn until the OS grants one) and so finishes late;
+  rather than guess a weighting to correct for that, the benchmark measures the
+  real x1/x2/x3 scaling on the console.
 
 ### Cache coherency
 
@@ -112,6 +113,56 @@ silently fell back to fewer threads cannot be misread as a scaling result.
 
 `RenderConfig` holds these as runtime state rather than compile-time constants,
 so a single build can sweep them all.
+
+## Hardware measurements (v1.0.2, New 3DS)
+
+The first real numbers this project has. The benchmark sweep, run for real on a
+New 3DS that reported `cores: 2`:
+
+| Case | ms/frame | fps |
+| --- | --- | --- |
+| `2AA d3 full xN` | 410.9 | 2.43 |
+| `2AA d3 full x1` | 822.5 | 1.22 |
+| `1AA d3 full x1` | 235.5 | 4.25 |
+| `1AA d3 full x2` | 117.8 | 8.49 |
+| `1AA d3 full x3` | 118.2 | 8.46 |
+| `1AA d2 full xN` | 122.7 | 8.15 |
+| `1AA d1 full xN` | 119.4 | 8.38 |
+| `1AA d0 full xN` | 83.5 | 11.98 |
+| `1AA d1 full no-shadows xN` | 96.9 | 10.32 |
+| `1AA d3 half xN` | 31.0 | 32.26 |
+| `1AA d1 half xN` | 29.3 | 34.07 |
+| `1AA d3 quarter xN` | 8.4 | 119.18 |
+| `1AA d1 quarter xN` | 8.0 | 124.59 |
+
+What the numbers say:
+
+- **Threading works and the split is right.** `235.5 / 117.8 = 1.999x` on two
+  cores. x3 equals x2 because only two cores were available, so the clamp
+  behaves correctly.
+- **The cross-core cache clean is sound.** No vertical stripes of stale pixels
+  appeared anywhere in the sweep — the first time `svcStoreProcessDataCache` had
+  ever actually executed, and it held up.
+- **Reflection bounces are essentially free; the first bounce is what costs.**
+  d3 (117.8) ~= d2 (122.7) ~= d1 (119.4), all within noise of each other. d1 vs
+  d0 is 119.4 vs 83.5 — about 36 ms for the first bounce alone. Hard shadows
+  cost about 22.5 ms (d1 with shadows 119.4 vs d1 without 96.9).
+
+### Is 20 fps reachable?
+
+20 fps means a 50 ms frame. At full 400×240 that is not reachable by tuning:
+
+- Even `1AA d0` — every reflection stripped out, which is no longer a
+  raytracer in any meaningful sense — is 83.5 ms, 12 fps.
+- Recovering a third core would take 117.8 ms to roughly 78.5 ms, about 12.7 fps.
+- Micro-optimisation on top of that is plausibly another 10-25%, landing
+  somewhere around 13-16 fps at full resolution.
+- Half resolution at full quality (`1AA d3 half`) is already 31.0 ms, 32.26
+  fps — comfortably past 20.
+
+So the target is reachable at half resolution with the raytracing fully
+intact, or it is not reachable at full resolution. Both of those are true at
+the same time; this is a resolution/quality trade-off, not a bug to chase.
 
 ## Updating
 
@@ -207,8 +258,64 @@ What that harness established for this release:
   go red, for the right reason, at the right magnitude.
 - **`powf` is gone from the render path.** Disassembling the shipped ELF finds
   exactly one call to it in the whole binary, inside `main` — the one-time table
-  build. `render_columns` is 338 instructions calling out only to `__divsi3` and
+  build. `render_columns` is 337 instructions calling out only to `__divsi3` and
   `trace`, and `sqrtf` compiles to a single hardware `vsqrt.f32`.
+
+## Hot-path optimisations (v1.0.3)
+
+Four changes, all in `source/main.c`, aimed at the ARM11 rather than the host:
+
+- **`ifloor()` replaces `floorf()`.**
+
+  ```c
+  static inline int ifloor(float x) { int i = (int)x; return i - (x < (float)i); }
+  ```
+
+  `trace()` was calling `floorf` four times per hit — twice in
+  `cube_face_color` for the cube's UV checker, twice in `scene_intersect` for
+  the ground plane's checker. On ARM `floorf` is a real `bl` into libm; on x86
+  it is a single hardware instruction, which is why the host harness cannot see
+  this win at all. Measured on the ARM ELF, this change alone: `trace` went 672
+  -> 626 instructions, and `floorf` call sites binary-wide went 8 -> 0. (The
+  shipped v1.0.3 `trace` is 633, because the `powi` unrolling below trades six
+  instructions back for a loop; see that bullet.)
+
+- **Distance-fade early-out in `trace()`.** Past `FADE_END` (55.0) the distance
+  fade is a full replacement of the surface colour by the sky, so the shadow
+  ray, the Phong terms, and an entire recursive reflection were being computed
+  and then discarded. `trace()` now returns `sky_color(rd)` immediately when
+  `fabsf(h.n.y) > 0.5f && h.t >= FADE_END` — the same test the fade itself
+  uses, so it cannot disagree with it: whenever it fires, the fade factor would
+  have been exactly 1. Honest scope: the geometry works out to about 2.7% of
+  pixels (`t >= FADE_END` needs `rd.y >= -0.026`, roughly 1.5 degrees of a
+  55-degree vertical FOV, about 6 of 240 rows). Real but minor; kept because it
+  is exact and free.
+
+- **`powi()` now unrolls.** The specular term passed `h->shininess` — a
+  runtime value — so `powi` stayed a real loop: eight iterations of
+  test/multiply/square/shift inside the hottest function in the program. The
+  scene only ever has two shininess values (`CUBE_SHININESS` 220,
+  `PLANE_SHININESS` 90), so the call site now dispatches on which one it is and
+  passes a compile-time constant, which lets GCC fold each into a
+  straight-line chain of `vmul.f32`. Measured on the ARM ELF: the longest
+  consecutive `vmul.f32` run inside `trace` went 3 -> 10 — that run *is* the
+  unrolled chain — `vmul.f32` count in `trace` went 30 -> 44, and two backward
+  loop branches disappeared. Price: +12 instructions binary-wide, i.e. +48 bytes
+  on a 126,856-byte `.text`, 0.04%, to delete an eight-iteration branchy loop
+  from the hottest function in the program.
+  Caveat worth repeating: adding a third material means adding a case at that
+  call site, or its specular highlight silently takes the plane's exponent.
+
+- **Core diagnostics.** v1.0.2 printed `cores: 2` on a New 3DS, one fewer than
+  expected, while the benchmark showed near-perfect 2.0x scaling — a throttled
+  core 1 would not give a clean 2.0x, so the suspicion was that the syscore
+  request had failed and the two cores in use were 0 and 2. That was
+  inference, not measurement, so v1.0.3 measures it instead: `threads_init()`
+  now retries `APT_SetAppCpuTimeLimit` at 80/70/50/30 percent instead of
+  giving up after one attempt, and records the result. Both the on-screen
+  banner and the benchmark `.txt` now print the actual core IDs in use and
+  either the syscore percentage that was granted or
+  `syscore REFUSED 0x........` with the real result code.
 
 ## Tunables
 
@@ -253,6 +360,7 @@ so a specific version can be installed rather than whatever is newest:
 | --- | --- | --- |
 | v1.0.1 | `v1.0.1` | `meta/qr-v1.0.1.png` |
 | v1.0.2 | `v1.0.2` | `meta/qr-v1.0.2.png` |
+| v1.0.3 | `v1.0.3` | `meta/qr-v1.0.3.png` |
 
 ## Art
 
@@ -270,18 +378,25 @@ CIA build. Replace them and rebuild if you want something better.
   check proven able to fail. See [Verifying the maths](#verifying-the-maths).
 - `powf` is absent from the render path in the **shipped ELF**, confirmed by
   disassembling that artifact rather than by reading the source.
+- **Real frame times, and that multicore actually helps.** Measured on a New
+  3DS: full-resolution 1AA renders scale x1 -> x2 at 235.5 ms -> 117.8 ms,
+  1.999x on two cores. See
+  [Hardware measurements](#hardware-measurements-v102-new-3ds).
+- **The cross-core cache clean.** No vertical stripes of stale pixels appeared
+  anywhere in the v1.0.2 benchmark sweep on that New 3DS — the first time
+  `svcStoreProcessDataCache` had ever actually executed outside compilation,
+  and it held up.
 
 **Not verified — these need hardware:**
 
-- **Real frame times, and whether multicore actually helps.** Nothing in this
-  release has been run on a console or an emulator. The benchmark exists
-  precisely because these numbers have to be measured, not predicted; the x1/x2/x3
-  cases are the ones that answer it.
-- **The cross-core cache clean.** The host harness deliberately stubs threading
-  out so the maths could be isolated, which means `svcStoreProcessDataCache` has
-  never actually executed. If it were wrong, the symptom would be vertical stripes
-  of stale pixels on the top screen. The failure path prints its error code on the
-  bottom screen rather than failing silently.
+- **Phase 3's speed on hardware, and the core-diagnostic readout.** v1.0.3 has
+  been proven bit-identical to v1.0.2 on the host harness — 0 pixels differing
+  on both the `-O2` and the `-O3 -ffast-math` arms — and the ARM instruction
+  counts in [Hot-path optimisations](#hot-path-optimisations-v103) are real,
+  measured on the shipped ELF. But none of it has run on a console: the
+  `ifloor`/early-out/`powi` wins are unmeasured in milliseconds, and the
+  retried `APT_SetAppCpuTimeLimit` ladder and the core-ID/syscore-percentage
+  readout have never been seen on real hardware.
 - **How it looks.**
 - **The entire updater.** The HTTP request, the redirect parsing, the download,
   and the AM install have never been executed — only compiled.
