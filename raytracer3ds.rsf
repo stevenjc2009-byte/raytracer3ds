@@ -216,6 +216,7 @@ AccessControlInfo:
    - APT:U
    - ac:u
    - am:net
+   - am:u
    - cfg:u
    - dsp::DSP
    - fs:USER

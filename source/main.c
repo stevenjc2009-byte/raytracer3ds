@@ -24,6 +24,7 @@
 #include <3ds.h>
 
 #include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -40,6 +41,18 @@
 #define FOV_DEG 55.0f     /* vertical field of view                            */
 #define FADE_START 18.0f  /* plane starts blending into the sky here...        */
 #define FADE_END 55.0f    /* ...and is fully sky here (kills checker moire)    */
+
+/* Updater. APP_VERSION is compared against the tag of the latest GitHub
+ * release -- bump it whenever a new release is cut, or the app will offer to
+ * install a build it is already running. */
+#define APP_VERSION "1.0.0"
+#define UPDATE_LATEST_URL \
+	"https://github.com/stevenjc2009-byte/raytracer3ds/releases/latest"
+#define UPDATE_CIA_URL \
+	"https://github.com/stevenjc2009-byte/raytracer3ds/releases/latest/download/raytracer3ds.cia"
+#define UPDATE_USER_AGENT "raytracer3ds-updater/" APP_VERSION
+#define DL_CHUNK (16 * 1024) /* download / CIA-write granularity */
+#define MAX_REDIRECTS 8      /* redirect chain depth before giving up */
 
 /* ------------------------------------------------------------------ VECTORS */
 
@@ -466,6 +479,355 @@ static void render_frame(u8 *fb, const Camera *cam)
 	}
 }
 
+/* ----------------------------------------------------------------- DISPLAY */
+
+/* Flush the CPU-written pixels out of cache and present both screens. */
+static void present(void)
+{
+	gfxFlushBuffers();
+	gfxSwapBuffers();
+	gspWaitForVBlank();
+}
+
+/* Write a status line into the updater's region of the bottom console.
+ * Row 10 and below; \x1b[K clears the rest of the line so shorter messages
+ * do not leave tails of longer ones behind. */
+static void status(int row, const char *fmt, ...)
+{
+	va_list args;
+
+	printf("\x1b[%d;1H\x1b[K", 10 + row);
+
+	va_start(args, fmt);
+	vprintf(fmt, args);
+	va_end(args);
+
+	present();
+}
+
+/* ---------------------------------------------------------------- UPDATER */
+
+static void parse_version(const char *s, int out[3])
+{
+	out[0] = out[1] = out[2] = 0;
+
+	if (*s == 'v' || *s == 'V')
+		s++;
+
+	int field = 0;
+	while (*s && field < 3) {
+		if (*s >= '0' && *s <= '9')
+			out[field] = out[field] * 10 + (*s - '0');
+		else if (*s == '.')
+			field++;
+		else
+			break; /* stop at any suffix, e.g. "1.2.0-beta" */
+		s++;
+	}
+}
+
+/* Strictly newer, so re-running the current version never offers an install. */
+static int version_is_newer(const char *candidate, const char *current)
+{
+	int a[3], b[3];
+
+	parse_version(candidate, a);
+	parse_version(current, b);
+
+	for (int i = 0; i < 3; i++) {
+		if (a[i] != b[i])
+			return a[i] > b[i];
+	}
+
+	return 0;
+}
+
+static int is_redirect(u32 status)
+{
+	return status == 301 || status == 302 || status == 303 ||
+	       status == 307 || status == 308;
+}
+
+/*
+ * Open a GET and send the request headers.
+ *
+ * SSL verification is disabled: the 3DS certificate store predates GitHub's
+ * current CA chain, so the built-in check rejects the connection outright.
+ * That makes the response untrusted input -- it is written straight into a CIA
+ * install handle, and nothing here authenticates it beyond coming from the
+ * expected host.
+ */
+static Result http_open(httpcContext *ctx, const char *url)
+{
+	Result rc = httpcOpenContext(ctx, HTTPC_METHOD_GET, url, 1);
+	if (R_FAILED(rc))
+		return rc;
+
+	httpcSetSSLOpt(ctx, SSLCOPT_DisableVerify);
+	httpcSetKeepAlive(ctx, HTTPC_KEEPALIVE_ENABLED);
+	httpcAddRequestHeaderField(ctx, "User-Agent", UPDATE_USER_AGENT);
+	httpcAddRequestHeaderField(ctx, "Connection", "Keep-Alive");
+
+	return httpcBeginRequest(ctx);
+}
+
+/*
+ * Read the tag of the latest release out of the redirect that GitHub serves
+ * for /releases/latest -- its Location ends in /releases/tag/vX.Y.Z.
+ *
+ * Deliberately NOT the REST API: that is rate limited to 60 requests per hour
+ * per IP, and the limit is shared, so it is routinely already exhausted before
+ * the console ever asks. The redirect has no such limit.
+ */
+static int update_fetch_latest_tag(char *tag, size_t tag_size)
+{
+	httpcContext ctx;
+	char location[512];
+	u32 code = 0;
+
+	Result rc = http_open(&ctx, UPDATE_LATEST_URL);
+	if (R_FAILED(rc)) {
+		status(0, "Request failed: 0x%08lX", (unsigned long)rc);
+		return 0;
+	}
+
+	rc = httpcGetResponseStatusCode(&ctx, &code);
+	if (R_FAILED(rc)) {
+		status(0, "No status code: 0x%08lX", (unsigned long)rc);
+		httpcCloseContext(&ctx);
+		return 0;
+	}
+
+	if (!is_redirect(code)) {
+		status(0, "Expected a redirect, got HTTP %lu", (unsigned long)code);
+		httpcCloseContext(&ctx);
+		return 0;
+	}
+
+	rc = httpcGetResponseHeader(&ctx, "Location", location, sizeof(location));
+	httpcCloseContext(&ctx);
+
+	if (R_FAILED(rc)) {
+		status(0, "No Location header: 0x%08lX", (unsigned long)rc);
+		return 0;
+	}
+
+	const char *last = strrchr(location, '/');
+	if (!last || !last[1]) {
+		status(0, "Could not parse a tag from the redirect");
+		return 0;
+	}
+
+	strncpy(tag, last + 1, tag_size - 1);
+	tag[tag_size - 1] = '\0';
+	return 1;
+}
+
+/*
+ * Download the release asset and stream it straight into a CIA install handle.
+ *
+ * libctru's httpc does not follow redirects, and the asset URL bounces to
+ * objects.githubusercontent.com, so the chain is walked by hand. The payload is
+ * never buffered whole -- each chunk goes to the install handle as it arrives,
+ * so memory use is DL_CHUNK regardless of how large the CIA grows.
+ */
+static int update_download_and_install(void)
+{
+	char url[512];
+	char location[512];
+	httpcContext ctx;
+	u32 code = 0;
+	int hop;
+
+	strncpy(url, UPDATE_CIA_URL, sizeof(url) - 1);
+	url[sizeof(url) - 1] = '\0';
+
+	for (hop = 0; hop <= MAX_REDIRECTS; hop++) {
+		Result rc = http_open(&ctx, url);
+		if (R_FAILED(rc)) {
+			status(0, "Download request failed: 0x%08lX", (unsigned long)rc);
+			return 0;
+		}
+
+		rc = httpcGetResponseStatusCode(&ctx, &code);
+		if (R_FAILED(rc)) {
+			status(0, "No status code: 0x%08lX", (unsigned long)rc);
+			httpcCloseContext(&ctx);
+			return 0;
+		}
+
+		if (!is_redirect(code))
+			break;
+
+		rc = httpcGetResponseHeader(&ctx, "Location", location,
+		                            sizeof(location));
+		httpcCloseContext(&ctx);
+		if (R_FAILED(rc)) {
+			status(0, "Redirect with no Location: 0x%08lX",
+			       (unsigned long)rc);
+			return 0;
+		}
+
+		strncpy(url, location, sizeof(url) - 1);
+		url[sizeof(url) - 1] = '\0';
+	}
+
+	if (hop > MAX_REDIRECTS) {
+		status(0, "Too many redirects (%d)", MAX_REDIRECTS);
+		return 0;
+	}
+
+	if (code != 200) {
+		status(0, "HTTP %lu downloading the CIA", (unsigned long)code);
+		httpcCloseContext(&ctx);
+		return 0;
+	}
+
+	u32 downloaded = 0, total = 0;
+	httpcGetDownloadSizeState(&ctx, &downloaded, &total);
+
+	Handle cia = 0;
+	Result rc = AM_StartCiaInstall(MEDIATYPE_SD, &cia);
+	if (R_FAILED(rc)) {
+		status(0, "AM_StartCiaInstall failed: 0x%08lX", (unsigned long)rc);
+		httpcCloseContext(&ctx);
+		return 0;
+	}
+
+	static u8 chunk[DL_CHUNK];
+	u64 offset = 0;
+	int ok = 1;
+
+	for (;;) {
+		u32 got = 0;
+		rc = httpcDownloadData(&ctx, chunk, sizeof(chunk), &got);
+
+		if (got > 0) {
+			u32 written = 0;
+			Result wrc = FSFILE_Write(cia, &written, offset, chunk, got, 0);
+
+			if (R_FAILED(wrc)) {
+				status(0, "CIA write failed: 0x%08lX", (unsigned long)wrc);
+				ok = 0;
+				break;
+			}
+			if (written != got) {
+				status(0, "Short CIA write: %lu of %lu bytes",
+				       (unsigned long)written, (unsigned long)got);
+				ok = 0;
+				break;
+			}
+
+			offset += got;
+			if (total)
+				status(1, "Installing... %lu%%  (%lu / %lu bytes)",
+				       (unsigned long)(offset * 100 / total),
+				       (unsigned long)offset, (unsigned long)total);
+			else
+				status(1, "Installing... %lu bytes",
+				       (unsigned long)offset);
+		}
+
+		if (rc == (Result)HTTPC_RESULTCODE_DOWNLOADPENDING)
+			continue; /* more data to come */
+
+		if (R_FAILED(rc)) {
+			status(0, "Download failed: 0x%08lX", (unsigned long)rc);
+			ok = 0;
+		}
+		break;
+	}
+
+	httpcCloseContext(&ctx);
+
+	if (!ok || offset == 0) {
+		if (offset == 0 && ok)
+			status(0, "Download was empty -- nothing installed");
+		AM_CancelCIAInstall(cia);
+		return 0;
+	}
+
+	rc = AM_FinishCiaInstall(cia);
+	if (R_FAILED(rc)) {
+		status(0, "AM_FinishCiaInstall failed: 0x%08lX", (unsigned long)rc);
+		return 0;
+	}
+
+	return 1;
+}
+
+/* Wait for a single button out of `mask`, returning which one was pressed.
+ * Used for the install confirmation -- an install is not something to start
+ * off the same keypress that asked for the check. */
+static u32 wait_for_keys(u32 mask)
+{
+	while (aptMainLoop()) {
+		hidScanInput();
+
+		const u32 down = hidKeysDown();
+		if (down & mask)
+			return down & mask;
+
+		gspWaitForVBlank();
+	}
+
+	return 0;
+}
+
+/* Y-button entry point: check, confirm, install. */
+static void run_update_check(void)
+{
+	char tag[64];
+
+	status(0, "Checking for updates...");
+	status(1, "");
+	status(2, "");
+
+	Result rc = httpcInit(0);
+	if (R_FAILED(rc)) {
+		status(0, "httpcInit failed: 0x%08lX", (unsigned long)rc);
+		return;
+	}
+
+	rc = amInit();
+	if (R_FAILED(rc)) {
+		status(0, "amInit failed: 0x%08lX (am:net/am:u denied?)",
+		       (unsigned long)rc);
+		httpcExit();
+		return;
+	}
+
+	if (!update_fetch_latest_tag(tag, sizeof(tag)))
+		goto done; /* the fetch already printed why */
+
+	if (!version_is_newer(tag, APP_VERSION)) {
+		status(0, "Up to date. Running v%s, latest is %s",
+		       APP_VERSION, tag);
+		goto done;
+	}
+
+	status(0, "Update available: %s (running v%s)", tag, APP_VERSION);
+	status(1, "A = download and install, B = cancel");
+
+	if (!(wait_for_keys(KEY_A | KEY_B) & KEY_A)) {
+		status(0, "Update cancelled.");
+		status(1, "");
+		goto done;
+	}
+
+	status(0, "Downloading %s ...", tag);
+
+	if (update_download_and_install()) {
+		status(0, "Installed %s. Exit and relaunch to run it.", tag);
+		status(1, "");
+	}
+	/* On failure the installer printed the specific error already. */
+
+done:
+	amExit();
+	httpcExit();
+}
+
 /* -------------------------------------------------------------------- MAIN */
 
 int main(int argc, char **argv)
@@ -483,10 +845,12 @@ int main(int argc, char **argv)
 	/* Bottom screen carries the status readout so the top screen stays a
 	 * clean render target. */
 	consoleInit(GFX_BOTTOM, NULL);
-	printf("3DS software ray tracer\n");
+	printf("3DS software ray tracer  v%s\n", APP_VERSION);
 	printf("%dx%d  %dx%d AA  %d bounces\n",
 	       SCREEN_W, SCREEN_H, AA, AA, MAX_DEPTH);
-	printf("\nPress START to exit.\n\n");
+	printf("\nSTART  exit\n");
+	printf("Y      check for updates -- hold it\n");
+	printf("       until the frame finishes\n");
 
 	Camera cam;
 	camera_setup(&cam);
@@ -495,8 +859,14 @@ int main(int argc, char **argv)
 
 	while (aptMainLoop()) {
 		hidScanInput();
-		if (hidKeysDown() & KEY_START)
+
+		/* Input is only sampled between frames, so a tap during a render
+		 * is missed -- the button has to be held until the frame ends. */
+		const u32 pressed = hidKeysDown();
+		if (pressed & KEY_START)
 			break;
+		if (pressed & KEY_Y)
+			run_update_check();
 
 		u16 fb_w = 0, fb_h = 0;
 		u8 *fb = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, &fb_w, &fb_h);
@@ -506,15 +876,12 @@ int main(int argc, char **argv)
 		const u64 elapsed = osGetTime() - t_start;
 
 		frame++;
-		printf("\x1b[7;1Hframe %-6lu  %6llu ms  %5.2f fps",
+		printf("\x1b[8;1Hframe %-6lu  %6llu ms  %5.2f fps",
 		       (unsigned long)frame,
 		       (unsigned long long)elapsed,
 		       elapsed ? 1000.0 / (double)elapsed : 0.0);
 
-		/* Push the CPU-written pixels out of cache, then present. */
-		gfxFlushBuffers();
-		gfxSwapBuffers();
-		gspWaitForVBlank();
+		present();
 	}
 
 	gfxExit();

@@ -34,8 +34,37 @@ A mirror-finish unit cube resting on an infinite reflective checkerboard plane.
 | Button | Action |
 | --- | --- |
 | START | Exit |
+| Y | Check GitHub for a newer release, and install it |
 
 The bottom screen shows frame count, frame time in milliseconds, and fps.
+
+Input is only sampled between frames, and a frame takes seconds — so **hold the
+button until the current frame finishes**. A quick tap lands between polls and
+is missed.
+
+## Updating
+
+Pressing **Y** asks GitHub for the latest release, compares it against
+`APP_VERSION` in [`source/main.c`](source/main.c), and if there is a newer one,
+offers to download and install it — A to confirm, B to cancel. The new CIA is
+streamed straight into an AM install handle in 16 KB chunks, so it is never
+buffered whole. Relaunch afterwards to run the new version.
+
+Two things worth knowing about how it works:
+
+- It reads the version out of the **302 redirect** on `/releases/latest` rather
+  than calling the GitHub REST API. The API allows 60 requests per hour per IP
+  and that budget is shared, so a self-updater built on it fails for reasons the
+  user cannot see. The redirect has no such limit.
+- **SSL verification is disabled** (`SSLCOPT_DisableVerify`). The 3DS
+  certificate store predates GitHub's current CA chain, so the console's
+  built-in check rejects the connection outright. That means the downloaded CIA
+  is unauthenticated — it is trusted purely on the basis of coming from the
+  expected URL.
+
+Installing needs the `am:net` / `am:u` service access granted in
+[`raytracer3ds.rsf`](raytracer3ds.rsf), so it only works from the installed CIA,
+not from a `.3dsx` under the Homebrew Launcher.
 
 ## Building
 
@@ -101,6 +130,8 @@ CIA build. Replace them and rebuild if you want something better.
   hand-derived and check out.
 - **Not verified:** how it actually looks, and its real frame time. Nothing here
   has been run on hardware or in an emulator.
+- **Not verified:** the entire updater. The HTTP request, the redirect parsing,
+  the download, and the AM install have never been executed — only compiled.
 
 ## Licence
 
