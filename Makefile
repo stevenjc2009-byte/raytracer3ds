@@ -49,7 +49,15 @@ APP_AUTHOR	:=	steve
 #---------------------------------------------------------------------------------
 ARCH	:=	-march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
 
-CFLAGS	:=	-g -Wall -O2 -mword-relocations \
+# -O3 and -ffast-math are load-bearing here, not decoration: this is a software
+# ray tracer, so the float maths in source/main.c IS the frame time.
+#
+# -ffast-math is safe for this program specifically because it never produces a
+# NaN or an infinity: every division is guarded by a magnitude test first (see
+# hit_box and hit_plane), and FAR_T is a large finite float rather than an inf.
+# The claim that the image is unchanged by these flags is checked on the host --
+# see "Verifying the maths" in README.md.
+CFLAGS	:=	-g -Wall -O3 -ffast-math -mword-relocations \
 			-ffunction-sections \
 			$(ARCH)
 

@@ -25,6 +25,7 @@
 
 #include <math.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -45,7 +46,7 @@
 /* Updater. APP_VERSION is compared against the tag of the latest GitHub
  * release -- bump it whenever a new release is cut, or the app will offer to
  * install a build it is already running. */
-#define APP_VERSION "1.0.1"
+#define APP_VERSION "1.0.2"
 #define UPDATE_LATEST_URL \
 	"https://github.com/stevenjc2009-byte/raytracer3ds/releases/latest"
 #define UPDATE_CIA_URL \
@@ -67,11 +68,12 @@ typedef struct {
 	int depth;   /* reflection bounces after the primary ray              */
 	int scale;   /* 1 = a ray per pixel; 2 = a ray per 2x2 block, etc.    */
 	int shadows; /* 0 skips the shadow ray entirely                       */
+	int threads; /* render threads; 0, or more than exist, means "all"    */
 } RenderConfig;
 
 /* Defaults match the compile-time constants above, so behaviour is unchanged
  * until something deliberately overwrites this. */
-static RenderConfig g_cfg = { AA, MAX_DEPTH, 1, 1 };
+static RenderConfig g_cfg = { AA, MAX_DEPTH, 1, 1, 0 };
 
 /* ------------------------------------------------------------------ VECTORS */
 
@@ -122,6 +124,33 @@ static inline float clampf(float v, float lo, float hi)
 	return (v < lo) ? lo : (v > hi) ? hi : v;
 }
 
+/*
+ * x raised to a non-negative integer power, by repeated squaring.
+ *
+ * This exists to keep powf() out of the inner loop. Every exponent in this
+ * program is an integer known at compile time -- the two sky terms and the two
+ * material shininess values -- and powf() remains a real function call even at
+ * -O3 -ffast-math: disassembling the ARM build shows `b powf`, whereas this
+ * compiles to a short chain of vmul.f32 with no call at all.
+ *
+ * For a large n the running square underflows to zero long before the result
+ * could matter (0.9^1024 is already about 1e-47), and zero is the right answer
+ * there anyway, so the early underflow costs nothing.
+ */
+static inline float powi(float x, int n)
+{
+	float r = 1.0f;
+
+	while (n) {
+		if (n & 1)
+			r *= x;
+		x *= x;
+		n >>= 1;
+	}
+
+	return r;
+}
+
 /* -------------------------------------------------------------------- SCENE */
 
 /* Unit cube, sitting on the plane so its base and the plane meet exactly. */
@@ -147,7 +176,7 @@ static const Vec3 CUBE_TINT_A = { 0.95f, 0.72f, 0.34f }; /* checker light square
 static const Vec3 CUBE_TINT_B = { 0.55f, 0.32f, 0.12f }; /* checker dark square  */
 static const Vec3 CUBE_REFL_TINT = { 0.98f, 0.84f, 0.58f };
 #define CUBE_REFLECTIVITY 0.82f
-#define CUBE_SHININESS 220.0f
+#define CUBE_SHININESS 220 /* integer: fed to powi(), not powf() */
 #define CUBE_SPEC 1.15f
 
 /* Plane material: polished checkerboard, Fresnel-weighted reflection. */
@@ -155,7 +184,7 @@ static const Vec3 PLANE_LIGHT = { 0.88f, 0.88f, 0.90f };
 static const Vec3 PLANE_DARK = { 0.06f, 0.07f, 0.09f };
 static const Vec3 PLANE_REFL_TINT = { 0.92f, 0.94f, 1.00f };
 #define PLANE_BASE_REFLECT 0.28f /* head-on reflectivity; Fresnel raises it */
-#define PLANE_SHININESS 90.0f
+#define PLANE_SHININESS 90 /* integer: fed to powi(), not powf() */
 #define PLANE_SPEC 0.55f
 
 /* ------------------------------------------------------------ INTERSECTIONS */
@@ -167,7 +196,7 @@ typedef struct {
 	Vec3 albedo;       /* diffuse colour at the hit                    */
 	Vec3 refl_tint;    /* colour multiplier applied to reflected light */
 	float reflectivity;
-	float shininess;
+	int shininess;     /* Phong exponent; integer so powi() can take it  */
 	float spec;
 } Hit;
 
@@ -345,8 +374,8 @@ static Vec3 sky_color(Vec3 rd)
 
 	const float sun = v_dot(rd, LIGHT_DIR);
 	if (sun > 0.0f) {
-		const float disc = powf(sun, 1200.0f) * 9.0f;
-		const float glow = powf(sun, 24.0f) * 0.35f;
+		const float disc = powi(sun, 1200) * 9.0f;
+		const float glow = powi(sun, 24) * 0.35f;
 		c = v_add(c, v_scale(LIGHT_COLOR, disc + glow));
 	}
 
@@ -377,7 +406,7 @@ static Vec3 shade_direct(const Hit *h, Vec3 view_dir)
 	const Vec3 light_refl = v_reflect(v_scale(LIGHT_DIR, -1.0f), h->n);
 	const float r_dot_v = v_dot(light_refl, v_scale(view_dir, -1.0f));
 	if (r_dot_v > 0.0f) {
-		const float s = powf(r_dot_v, h->shininess) * h->spec;
+		const float s = powi(r_dot_v, h->shininess) * h->spec;
 		color = v_add(color, v_scale(LIGHT_COLOR, s));
 	}
 
@@ -426,17 +455,53 @@ static Vec3 trace(Vec3 ro, Vec3 rd, int depth)
  * byte offset 3 * (x * SCREEN_H + (SCREEN_H - 1 - y)).
  */
 /*
+ * Gamma encoding, linear -> display, through a table indexed by sqrt(linear)
+ * rather than by the linear value directly.
+ *
+ * Indexing on the linear value would need an impractically large table: the
+ * slope of v^(1/2.2) runs away to infinity at black, so a 1024-entry linear
+ * table is several output levels wrong in the shadows -- exactly where banding
+ * shows. Substituting s = sqrt(v) reshapes the curve into 255 * s^(2/2.2),
+ * whose slope varies by less than a factor of two across the entire range, so
+ * 1024 entries keep the error under a quarter of one output level everywhere.
+ *
+ * The substitution is worth it because sqrtf is a single vsqrt.f32 instruction
+ * on the ARM11's VFP (verified by disassembling the ARM build), so this trades
+ * a powf call per channel for one hardware square root and one byte load.
+ */
+/* Overridable so the verification harness can isolate how much of any pixel
+ * difference is this table's quantisation and how much is anything else. */
+#ifndef GAMMA_LUT_SIZE
+#define GAMMA_LUT_SIZE 1024
+#endif
+static u8 g_gamma_lut[GAMMA_LUT_SIZE];
+
+static void gamma_lut_init(void)
+{
+	for (int i = 0; i < GAMMA_LUT_SIZE; i++) {
+		/* i indexes s = sqrt(linear), so the encoded value for that
+		 * entry is (s*s)^(1/2.2), which is s^(2/2.2). */
+		const float s = (float)i / (float)(GAMMA_LUT_SIZE - 1);
+		g_gamma_lut[i] = (u8)(powf(s, 2.0f / 2.2f) * 255.0f + 0.5f);
+	}
+}
+
+static inline u8 gamma_encode(float v)
+{
+	const float s = sqrtf(clampf(v, 0.0f, 1.0f));
+	return g_gamma_lut[(int)(s * (float)(GAMMA_LUT_SIZE - 1) + 0.5f)];
+}
+
+/*
  * Write one traced sample as a `scale` x `scale` block of framebuffer pixels.
  * At scale 1 this is a single pixel and the loops collapse; above that, one ray
  * covers the block, which is where the big frame-time savings come from.
  */
 static inline void put_block(u8 *fb, int x0, int y0, int scale, Vec3 c)
 {
-	/* Clamp, then gamma-encode from linear to sRGB-ish for display. */
-	const float inv_gamma = 1.0f / 2.2f;
-	const u8 r = (u8)(powf(clampf(c.x, 0.0f, 1.0f), inv_gamma) * 255.0f + 0.5f);
-	const u8 g = (u8)(powf(clampf(c.y, 0.0f, 1.0f), inv_gamma) * 255.0f + 0.5f);
-	const u8 b = (u8)(powf(clampf(c.z, 0.0f, 1.0f), inv_gamma) * 255.0f + 0.5f);
+	const u8 r = gamma_encode(c.x);
+	const u8 g = gamma_encode(c.y);
+	const u8 b = gamma_encode(c.z);
 
 	for (int dx = 0; dx < scale; dx++) {
 		const int x = x0 + dx;
@@ -492,20 +557,27 @@ static Vec3 camera_ray(const Camera *cam, float px, float py)
 /* ------------------------------------------------------------------ RENDER */
 
 /*
- * Trace the band of block-rows [row_begin, row_end) into the framebuffer.
+ * Trace one interleaved set of block-columns -- col_begin, col_begin+col_step,
+ * col_begin+2*col_step, ... -- into the framebuffer.
  *
- * Split out from render_frame so a worker thread can be handed a slice of the
- * image; the bands touch disjoint pixels, so they need no locking.
+ * Columns rather than rows, for two independent reasons. The framebuffer is
+ * column-major, so a single column is one contiguous 3*SCREEN_H byte run and
+ * the inner loop walks memory sequentially; iterating rows instead strides 720
+ * bytes between neighbouring pixels. And because a column is contiguous, two
+ * threads working on different columns share a cache line only at the column
+ * boundary -- interleaving rows would have put both threads inside the same
+ * line on every single pixel, which is the worst possible arrangement.
  */
-static void render_band(u8 *fb, const Camera *cam, int row_begin, int row_end)
+static void render_columns(u8 *fb, const Camera *cam, int col_begin, int col_step)
 {
 	const int scale = g_cfg.scale;
 	const int aa = g_cfg.aa;
 	const int cols = SCREEN_W / scale;
+	const int rows = SCREEN_H / scale;
 	const float inv_samples = 1.0f / (float)(aa * aa);
 
-	for (int y = row_begin; y < row_end; y++) {
-		for (int x = 0; x < cols; x++) {
+	for (int x = col_begin; x < cols; x += col_step) {
+		for (int y = 0; y < rows; y++) {
 			Vec3 acc = v3(0.0f, 0.0f, 0.0f);
 
 			/* Regular aa x aa grid of sample positions inside the block. */
@@ -532,9 +604,147 @@ static void render_band(u8 *fb, const Camera *cam, int row_begin, int row_end)
 	}
 }
 
+/* --------------------------------------------------------------- THREADING */
+
+/*
+ * The render is split across CPU cores by handing each thread its own
+ * interleaved set of columns. The sets touch disjoint framebuffer bytes and
+ * only ever read g_cfg, so there is no lock anywhere in the render -- the join
+ * is the only synchronisation.
+ *
+ * Which cores exist, per libctru's thread.h:
+ *   core 0  application core, always available; the main thread runs here
+ *   core 1  system core. A thread only starts here once the app has been
+ *           granted a share of it via APT_SetAppCpuTimeLimit, and it then gets
+ *           only that percentage
+ *   core 2  New 3DS only, and only with exheader kernel flag 0x2000 -- which is
+ *           what CanAccessCore2 in raytracer3ds.rsf sets. That flag lives in
+ *           the CIA, so this core is unavailable to the .3dsx build
+ *   core 3  not available to normal applications at all
+ *
+ * The column split is equal across threads. Core 1 only gets SYSCORE_TIME_LIMIT
+ * percent of its core, so it is expected to be the straggler and the measured
+ * speedup should fall short of the thread count. The benchmark's x1/x2/x3 cases
+ * exist to measure that shortfall rather than have a guessed weighting baked in
+ * here -- once there are real numbers, the split can be weighted to match.
+ */
+#define MAX_RENDER_THREADS 3
+#define WORKER_STACK_SIZE (32 * 1024)
+#define SYSCORE_TIME_LIMIT 80 /* percent of core 1 requested for this app */
+
+static int g_max_threads = 1;            /* resolved once by threads_init() */
+static int g_worker_prio = 0x30;         /* overwritten with the real value */
+static u8 g_cores[MAX_RENDER_THREADS];   /* g_cores[0] is always core 0     */
+static Result g_worker_cache_rc = 0;     /* first cache-clean failure, if any */
+
+typedef struct {
+	u8 *fb;
+	const Camera *cam;
+	int col_begin;
+	int col_step;
+} RenderJob;
+
+/*
+ * Worker entry point.
+ *
+ * The cache clean at the end is not housekeeping, it is required for the image
+ * to be correct. This thread wrote pixels through its own core's L1 data cache,
+ * and the display controller is not a coherent bus master. gfxFlushBuffers() on
+ * the main thread cleans core 0's cache only -- ARMv6 cache maintenance by
+ * address is not broadcast to other cores -- so without this, every column
+ * traced off-core would reach the screen as whatever was in the framebuffer
+ * before. svcStoreProcessDataCache is used rather than GSPGPU_FlushDataCache
+ * because it is a plain syscall with no shared service session, so several
+ * threads can call it at once. Cleaning lines this thread did not dirty is
+ * harmless; it is a clean, not an invalidate.
+ */
+static void render_worker(void *arg)
+{
+	const RenderJob *job = (const RenderJob *)arg;
+
+	render_columns(job->fb, job->cam, job->col_begin, job->col_step);
+
+	/* Via uintptr_t: a plain (u32) cast is exact on the ARM11's 32-bit
+	 * pointers but warns when this file is compiled on a 64-bit host, which
+	 * the verification harness does. */
+	const Result rc = svcStoreProcessDataCache(CUR_PROCESS_HANDLE,
+	                                           (u32)(uintptr_t)job->fb,
+	                                           SCREEN_W * SCREEN_H * 3);
+	if (R_FAILED(rc) && g_worker_cache_rc == 0)
+		g_worker_cache_rc = rc; /* surfaced by main; never silent */
+}
+
+static int is_new_3ds(void); /* defined with the benchmark, below */
+
+/* Work out how many cores this build can actually use, once, at startup. */
+static void threads_init(void)
+{
+	s32 prio = 0;
+
+	if (R_SUCCEEDED(svcGetThreadPriority(&prio, CUR_THREAD_HANDLE)))
+		g_worker_prio = prio;
+
+	g_cores[0] = 0; /* this thread */
+	g_max_threads = 1;
+
+	if (R_SUCCEEDED(APT_SetAppCpuTimeLimit(SYSCORE_TIME_LIMIT)))
+		g_cores[g_max_threads++] = 1;
+
+	/* Asking is cheap and threadCreate failing is handled below, so this
+	 * does not also try to detect the exheader flag -- a .3dsx on a New 3DS
+	 * will simply fail to start the thread and fall back. */
+	if (is_new_3ds() && g_max_threads < MAX_RENDER_THREADS)
+		g_cores[g_max_threads++] = 2;
+}
+
 static void render_frame(u8 *fb, const Camera *cam)
 {
-	render_band(fb, cam, 0, SCREEN_H / g_cfg.scale);
+	int nthreads = g_cfg.threads;
+
+	/* 0, or more than exist, both mean "use everything available". */
+	if (nthreads <= 0 || nthreads > g_max_threads)
+		nthreads = g_max_threads;
+
+	if (nthreads <= 1) {
+		render_columns(fb, cam, 0, 1);
+		return;
+	}
+
+	Thread workers[MAX_RENDER_THREADS - 1];
+	RenderJob jobs[MAX_RENDER_THREADS - 1];
+	int started = 0;
+
+	/* Slot 0 belongs to this thread; worker i takes slot i+1. */
+	for (int i = 0; i + 1 < nthreads; i++) {
+		jobs[i].fb = fb;
+		jobs[i].cam = cam;
+		jobs[i].col_begin = i + 1;
+		jobs[i].col_step = nthreads;
+
+		workers[i] = threadCreate(render_worker, &jobs[i],
+		                          WORKER_STACK_SIZE, g_worker_prio,
+		                          (int)g_cores[i + 1], false);
+		if (!workers[i])
+			break;
+
+		started++;
+	}
+
+	/*
+	 * Any slot that did not get a thread is covered here instead. The stride
+	 * stays nthreads for everyone either way, so no column is ever left
+	 * untraced and none is traced twice -- a thread failing to start costs
+	 * speed, never correctness.
+	 */
+	for (int slot = started + 1; slot < nthreads; slot++)
+		render_columns(fb, cam, slot, nthreads);
+
+	render_columns(fb, cam, 0, nthreads);
+
+	for (int i = 0; i < started; i++) {
+		threadJoin(workers[i], U64_MAX);
+		threadFree(workers[i]);
+	}
 }
 
 /* ----------------------------------------------------------------- DISPLAY */
@@ -901,16 +1111,20 @@ typedef struct {
 } BenchCase;
 
 static BenchCase g_bench[] = {
-	/* name              aa  depth scale shadows */
-	{ "2AA d3 full",    { 2, 3, 1, 1 }, 0.0 }, /* the shipped default */
-	{ "1AA d3 full",    { 1, 3, 1, 1 }, 0.0 }, /* cost of supersampling */
-	{ "1AA d2 full",    { 1, 2, 1, 1 }, 0.0 },
-	{ "1AA d1 full",    { 1, 1, 1, 1 }, 0.0 },
-	{ "1AA d0 full",    { 1, 0, 1, 1 }, 0.0 }, /* cost of all reflections */
-	{ "1AA d1 full ns", { 1, 1, 1, 0 }, 0.0 }, /* cost of shadow rays */
-	{ "1AA d3 half",    { 1, 3, 2, 1 }, 0.0 },
-	{ "1AA d1 half",    { 1, 1, 2, 1 }, 0.0 },
-	{ "1AA d3 qtr",     { 1, 3, 4, 1 }, 0.0 },
+	/* name                aa depth scale shadow threads */
+	{ "2AA d3 full xN",  { 2, 3, 1, 1, 0 }, 0.0 }, /* the shipped default  */
+	{ "2AA d3 full x1",  { 2, 3, 1, 1, 1 }, 0.0 }, /* ...on one core       */
+	{ "1AA d3 full x1",  { 1, 3, 1, 1, 1 }, 0.0 }, /* thread scaling: the  */
+	{ "1AA d3 full x2",  { 1, 3, 1, 1, 2 }, 0.0 }, /* same work on 1, 2    */
+	{ "1AA d3 full x3",  { 1, 3, 1, 1, 3 }, 0.0 }, /* and 3 cores          */
+	{ "1AA d2 full xN",  { 1, 2, 1, 1, 0 }, 0.0 }, /* cost of each bounce  */
+	{ "1AA d1 full xN",  { 1, 1, 1, 1, 0 }, 0.0 },
+	{ "1AA d0 full xN",  { 1, 0, 1, 1, 0 }, 0.0 }, /* all reflections off  */
+	{ "1AA d1 fl ns xN", { 1, 1, 1, 0, 0 }, 0.0 }, /* cost of shadow rays  */
+	{ "1AA d3 half xN",  { 1, 3, 2, 1, 0 }, 0.0 }, /* cost of resolution   */
+	{ "1AA d1 half xN",  { 1, 1, 2, 1, 0 }, 0.0 },
+	{ "1AA d3 qtr xN",   { 1, 3, 4, 1, 0 }, 0.0 },
+	{ "1AA d1 qtr xN",   { 1, 1, 4, 1, 0 }, 0.0 },
 };
 
 #define BENCH_COUNT ((int)(sizeof(g_bench) / sizeof(g_bench[0])))
@@ -933,8 +1147,11 @@ static void write_bench_report(void)
 	fprintf(f, "raytracer3ds v%s benchmark\n", APP_VERSION);
 	fprintf(f, "console: %s\n", is_new_3ds() ? "New 3DS" : "Old 3DS");
 	fprintf(f, "screen : %dx%d\n", SCREEN_W, SCREEN_H);
+	fprintf(f, "cores  : %d usable (core 1 capped at %d%%)\n",
+	        g_max_threads, SYSCORE_TIME_LIMIT);
 	fprintf(f, "target : 50.0 ms for 20 fps\n\n");
-	fprintf(f, "%-16s %10s %8s %8s\n", "config", "ms", "fps", "rays");
+	fprintf(f, "%-16s %10s %8s %4s %10s\n",
+	        "config", "ms", "fps", "thr", "rays");
 
 	for (int i = 0; i < BENCH_COUNT; i++) {
 		const RenderConfig *c = &g_bench[i].cfg;
@@ -942,10 +1159,17 @@ static void write_bench_report(void)
 		                  (long)(SCREEN_H / c->scale) *
 		                  (long)(c->aa * c->aa);
 
-		fprintf(f, "%-16s %10.1f %8.2f %8ld\n",
+		/* The thread count actually used, which is not always the one
+		 * asked for -- an x3 case on an Old 3DS runs on 2. */
+		const int thr = (c->threads <= 0 || c->threads > g_max_threads)
+		                        ? g_max_threads
+		                        : c->threads;
+
+		fprintf(f, "%-16s %10.1f %8.2f %4d %10ld\n",
 		        g_bench[i].name,
 		        g_bench[i].ms,
 		        g_bench[i].ms > 0.0 ? 1000.0 / g_bench[i].ms : 0.0,
+		        thr,
 		        rays);
 	}
 
@@ -990,10 +1214,10 @@ static void run_benchmark(const Camera *cam)
 	g_cfg = saved;
 
 	/* Results table, one row per case. */
-	status(0, "%-14s %8s %6s", "config", "ms", "fps");
+	status(0, "%-15s %7s %6s", "config", "ms", "fps");
 	for (int i = 0; i < BENCH_COUNT; i++) {
 		const double ms = g_bench[i].ms;
-		status(i + 1, "%-14s %8.1f %6.2f",
+		status(i + 1, "%-15s %7.1f %6.2f",
 		       g_bench[i].name, ms, ms > 0.0 ? 1000.0 / ms : 0.0);
 	}
 
@@ -1014,13 +1238,17 @@ int main(int argc, char **argv)
 	 * no-op. Purely a speed knob -- it does not change what is rendered. */
 	osSetSpeedupEnable(true);
 
+	gamma_lut_init();
+	threads_init();
+
 	/* Bottom screen carries the status readout so the top screen stays a
 	 * clean render target. */
 	consoleInit(GFX_BOTTOM, NULL);
 	printf("3DS software ray tracer  v%s\n", APP_VERSION);
 	printf("%dx%d  %dx%d AA  %d bounces\n",
 	       SCREEN_W, SCREEN_H, AA, AA, MAX_DEPTH);
-	printf("console: %s\n", is_new_3ds() ? "New 3DS" : "Old 3DS");
+	printf("console: %s   cores: %d\n",
+	       is_new_3ds() ? "New 3DS" : "Old 3DS", g_max_threads);
 	printf("\nSTART   exit\n");
 	printf("Y       check for updates\n");
 	printf("SELECT  run benchmark\n");
@@ -1057,6 +1285,13 @@ int main(int argc, char **argv)
 		       (unsigned long)frame,
 		       (unsigned long long)elapsed,
 		       elapsed ? 1000.0 / (double)elapsed : 0.0);
+
+		/* A failed cache clean in a worker means the columns it traced
+		 * may be reaching the screen as stale pixels. Say so rather than
+		 * letting it read as a rendering bug. */
+		if (g_worker_cache_rc != 0)
+			printf("\x1b[12;1Hworker cache clean failed: 0x%08lX",
+			       (unsigned long)g_worker_cache_rc);
 
 		present();
 	}
