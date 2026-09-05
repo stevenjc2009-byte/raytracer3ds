@@ -82,6 +82,13 @@ delete the line if you want the slower clock.
 Grab the `.cia` from [Releases](../../releases), copy it to your SD card, and
 install it with FBI. Requires custom firmware.
 
+## Install on your 3DS
+
+![QR](meta/qr-latest.png)
+
+Scan this in FBI's "Scan QR Code" to download and install the latest release
+directly on the console.
+
 ## Art
 
 The icon and banner in `meta/` are **placeholder art**, generated to make the
