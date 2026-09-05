@@ -35,12 +35,35 @@ A mirror-finish unit cube resting on an infinite reflective checkerboard plane.
 | --- | --- |
 | START | Exit |
 | Y | Check GitHub for a newer release, and install it |
+| SELECT | Run the benchmark sweep |
 
 The bottom screen shows frame count, frame time in milliseconds, and fps.
 
 Input is only sampled between frames, and a frame takes seconds — so **hold the
 button until the current frame finishes**. A quick tap lands between polls and
 is missed.
+
+## Benchmark
+
+**SELECT** sweeps nine quality configurations, timing a real full-screen render
+for each on the console itself — nothing synthetic, every case goes through the
+ordinary render path. Results print as a `config / ms / fps` table on the bottom
+screen and are written to `sdmc:/raytracer3ds_bench.txt`. **B** aborts the sweep.
+
+The cases isolate one lever each, so the cost of supersampling, of each
+reflection bounce, of the shadow rays, and of resolution can be read separately
+rather than guessed at:
+
+| Case | Isolates |
+| --- | --- |
+| `2AA d3 full` | the shipped default |
+| `1AA d3 full` | cost of 2×2 supersampling |
+| `1AA d2 / d1 / d0 full` | cost of each reflection bounce |
+| `1AA d1 full ns` | cost of the shadow rays |
+| `1AA d3 half`, `1AA d1 half`, `1AA d3 qtr` | cost of resolution |
+
+`RenderConfig` holds these as runtime state rather than compile-time constants,
+so a single build can sweep them all.
 
 ## Updating
 
@@ -117,6 +140,13 @@ install it with FBI. Requires custom firmware.
 
 Scan this in FBI's "Scan QR Code" to download and install the latest release
 directly on the console.
+
+Each release also gets its own branch and its own pinned QR code under `meta/`,
+so a specific version can be installed rather than whatever is newest:
+
+| Version | Branch | QR |
+| --- | --- | --- |
+| v1.0.1 | `v1.0.1` | `meta/qr-v1.0.1.png` |
 
 ## Art
 

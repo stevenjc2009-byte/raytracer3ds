@@ -45,7 +45,7 @@
 /* Updater. APP_VERSION is compared against the tag of the latest GitHub
  * release -- bump it whenever a new release is cut, or the app will offer to
  * install a build it is already running. */
-#define APP_VERSION "1.0.0"
+#define APP_VERSION "1.0.1"
 #define UPDATE_LATEST_URL \
 	"https://github.com/stevenjc2009-byte/raytracer3ds/releases/latest"
 #define UPDATE_CIA_URL \
@@ -53,6 +53,25 @@
 #define UPDATE_USER_AGENT "raytracer3ds-updater/" APP_VERSION
 #define DL_CHUNK (16 * 1024) /* download / CIA-write granularity */
 #define MAX_REDIRECTS 8      /* redirect chain depth before giving up */
+
+/* ---------------------------------------------------- RUNTIME RENDER CONFIG */
+
+/*
+ * The quality knobs are runtime state rather than compile-time constants, so
+ * the benchmark can sweep them in a single run on real hardware. Treated as
+ * read-only for the duration of a render, which is what will make it safe to
+ * share across render threads later.
+ */
+typedef struct {
+	int aa;      /* samples per axis; 1 disables supersampling            */
+	int depth;   /* reflection bounces after the primary ray              */
+	int scale;   /* 1 = a ray per pixel; 2 = a ray per 2x2 block, etc.    */
+	int shadows; /* 0 skips the shadow ray entirely                       */
+} RenderConfig;
+
+/* Defaults match the compile-time constants above, so behaviour is unchanged
+ * until something deliberately overwrites this. */
+static RenderConfig g_cfg = { AA, MAX_DEPTH, 1, 1 };
 
 /* ------------------------------------------------------------------ VECTORS */
 
@@ -344,9 +363,11 @@ static Vec3 shade_direct(const Hit *h, Vec3 view_dir)
 	if (n_dot_l <= 0.0f)
 		return color; /* facing away from the light: ambient only */
 
-	const Vec3 shadow_origin = v_add(h->p, v_scale(h->n, RAY_EPS));
-	if (scene_occluded(shadow_origin, LIGHT_DIR, RAY_EPS, FAR_T))
-		return color;
+	if (g_cfg.shadows) {
+		const Vec3 shadow_origin = v_add(h->p, v_scale(h->n, RAY_EPS));
+		if (scene_occluded(shadow_origin, LIGHT_DIR, RAY_EPS, FAR_T))
+			return color;
+	}
 
 	/* Diffuse */
 	const Vec3 diffuse = v_scale(v_mul(h->albedo, LIGHT_COLOR), n_dot_l);
@@ -375,7 +396,7 @@ static Vec3 trace(Vec3 ro, Vec3 rd, int depth)
 
 	Vec3 color = shade_direct(&h, rd);
 
-	if (depth < MAX_DEPTH && h.reflectivity > 0.001f) {
+	if (depth < g_cfg.depth && h.reflectivity > 0.001f) {
 		const Vec3 refl_dir = v_norm(v_reflect(rd, h.n));
 		const Vec3 refl_origin = v_add(h.p, v_scale(h.n, RAY_EPS));
 		const Vec3 reflected = trace(refl_origin, refl_dir, depth + 1);
@@ -404,18 +425,35 @@ static Vec3 trace(Vec3 ro, Vec3 rd, int depth)
  * display coordinate (x, y), y measured downwards from the top, lives at
  * byte offset 3 * (x * SCREEN_H + (SCREEN_H - 1 - y)).
  */
-static inline void put_pixel(u8 *fb, int x, int y, Vec3 c)
+/*
+ * Write one traced sample as a `scale` x `scale` block of framebuffer pixels.
+ * At scale 1 this is a single pixel and the loops collapse; above that, one ray
+ * covers the block, which is where the big frame-time savings come from.
+ */
+static inline void put_block(u8 *fb, int x0, int y0, int scale, Vec3 c)
 {
 	/* Clamp, then gamma-encode from linear to sRGB-ish for display. */
 	const float inv_gamma = 1.0f / 2.2f;
-	const float r = powf(clampf(c.x, 0.0f, 1.0f), inv_gamma);
-	const float g = powf(clampf(c.y, 0.0f, 1.0f), inv_gamma);
-	const float b = powf(clampf(c.z, 0.0f, 1.0f), inv_gamma);
+	const u8 r = (u8)(powf(clampf(c.x, 0.0f, 1.0f), inv_gamma) * 255.0f + 0.5f);
+	const u8 g = (u8)(powf(clampf(c.y, 0.0f, 1.0f), inv_gamma) * 255.0f + 0.5f);
+	const u8 b = (u8)(powf(clampf(c.z, 0.0f, 1.0f), inv_gamma) * 255.0f + 0.5f);
 
-	u8 *px = fb + 3 * (x * SCREEN_H + (SCREEN_H - 1 - y));
-	px[0] = (u8)(b * 255.0f + 0.5f);
-	px[1] = (u8)(g * 255.0f + 0.5f);
-	px[2] = (u8)(r * 255.0f + 0.5f);
+	for (int dx = 0; dx < scale; dx++) {
+		const int x = x0 + dx;
+		if (x >= SCREEN_W)
+			break;
+
+		for (int dy = 0; dy < scale; dy++) {
+			const int y = y0 + dy;
+			if (y >= SCREEN_H)
+				break;
+
+			u8 *px = fb + 3 * (x * SCREEN_H + (SCREEN_H - 1 - y));
+			px[0] = b;
+			px[1] = g;
+			px[2] = r;
+		}
+	}
 }
 
 /* ------------------------------------------------------------------ CAMERA */
@@ -453,30 +491,50 @@ static Vec3 camera_ray(const Camera *cam, float px, float py)
 
 /* ------------------------------------------------------------------ RENDER */
 
-static void render_frame(u8 *fb, const Camera *cam)
+/*
+ * Trace the band of block-rows [row_begin, row_end) into the framebuffer.
+ *
+ * Split out from render_frame so a worker thread can be handed a slice of the
+ * image; the bands touch disjoint pixels, so they need no locking.
+ */
+static void render_band(u8 *fb, const Camera *cam, int row_begin, int row_end)
 {
-	const float inv_samples = 1.0f / (float)(AA * AA);
+	const int scale = g_cfg.scale;
+	const int aa = g_cfg.aa;
+	const int cols = SCREEN_W / scale;
+	const float inv_samples = 1.0f / (float)(aa * aa);
 
-	for (int y = 0; y < SCREEN_H; y++) {
-		for (int x = 0; x < SCREEN_W; x++) {
+	for (int y = row_begin; y < row_end; y++) {
+		for (int x = 0; x < cols; x++) {
 			Vec3 acc = v3(0.0f, 0.0f, 0.0f);
 
-			/* Regular AA x AA grid of sample positions inside the pixel. */
-			for (int sy = 0; sy < AA; sy++) {
-				for (int sx = 0; sx < AA; sx++) {
-					const float ox = ((float)sx + 0.5f) / (float)AA;
-					const float oy = ((float)sy + 0.5f) / (float)AA;
+			/* Regular aa x aa grid of sample positions inside the block. */
+			for (int sy = 0; sy < aa; sy++) {
+				for (int sx = 0; sx < aa; sx++) {
+					const float ox = ((float)sx + 0.5f) / (float)aa;
+					const float oy = ((float)sy + 0.5f) / (float)aa;
 
-					const Vec3 dir = camera_ray(cam,
-					                            (float)x + ox,
-					                            (float)y + oy);
+					/* Block coordinates scale back up to full-res
+					 * screen space before ray generation, so the
+					 * camera never has to know the render scale. */
+					const Vec3 dir = camera_ray(
+					        cam,
+					        ((float)x + ox) * (float)scale,
+					        ((float)y + oy) * (float)scale);
+
 					acc = v_add(acc, trace(cam->origin, dir, 0));
 				}
 			}
 
-			put_pixel(fb, x, y, v_scale(acc, inv_samples));
+			put_block(fb, x * scale, y * scale, scale,
+			          v_scale(acc, inv_samples));
 		}
 	}
+}
+
+static void render_frame(u8 *fb, const Camera *cam)
+{
+	render_band(fb, cam, 0, SCREEN_H / g_cfg.scale);
 }
 
 /* ----------------------------------------------------------------- DISPLAY */
@@ -496,7 +554,7 @@ static void status(int row, const char *fmt, ...)
 {
 	va_list args;
 
-	printf("\x1b[%d;1H\x1b[K", 10 + row);
+	printf("\x1b[%d;1H\x1b[K", 13 + row);
 
 	va_start(args, fmt);
 	vprintf(fmt, args);
@@ -828,6 +886,120 @@ done:
 	httpcExit();
 }
 
+/* -------------------------------------------------------------- BENCHMARK */
+
+/*
+ * Sweeps the quality knobs and times a real full-screen render for each, on
+ * the actual console. Every case renders to the real framebuffer through the
+ * ordinary path -- nothing synthetic -- so the numbers are what the app would
+ * genuinely run at with that configuration.
+ */
+typedef struct {
+	const char *name;
+	RenderConfig cfg;
+	double ms;
+} BenchCase;
+
+static BenchCase g_bench[] = {
+	/* name              aa  depth scale shadows */
+	{ "2AA d3 full",    { 2, 3, 1, 1 }, 0.0 }, /* the shipped default */
+	{ "1AA d3 full",    { 1, 3, 1, 1 }, 0.0 }, /* cost of supersampling */
+	{ "1AA d2 full",    { 1, 2, 1, 1 }, 0.0 },
+	{ "1AA d1 full",    { 1, 1, 1, 1 }, 0.0 },
+	{ "1AA d0 full",    { 1, 0, 1, 1 }, 0.0 }, /* cost of all reflections */
+	{ "1AA d1 full ns", { 1, 1, 1, 0 }, 0.0 }, /* cost of shadow rays */
+	{ "1AA d3 half",    { 1, 3, 2, 1 }, 0.0 },
+	{ "1AA d1 half",    { 1, 1, 2, 1 }, 0.0 },
+	{ "1AA d3 qtr",     { 1, 3, 4, 1 }, 0.0 },
+};
+
+#define BENCH_COUNT ((int)(sizeof(g_bench) / sizeof(g_bench[0])))
+#define BENCH_REPORT_PATH "sdmc:/raytracer3ds_bench.txt"
+
+static int is_new_3ds(void)
+{
+	bool isnew = false;
+	return R_SUCCEEDED(APT_CheckNew3DS(&isnew)) && isnew;
+}
+
+static void write_bench_report(void)
+{
+	FILE *f = fopen(BENCH_REPORT_PATH, "w");
+	if (!f) {
+		status(BENCH_COUNT + 2, "Could not write %s", BENCH_REPORT_PATH);
+		return;
+	}
+
+	fprintf(f, "raytracer3ds v%s benchmark\n", APP_VERSION);
+	fprintf(f, "console: %s\n", is_new_3ds() ? "New 3DS" : "Old 3DS");
+	fprintf(f, "screen : %dx%d\n", SCREEN_W, SCREEN_H);
+	fprintf(f, "target : 50.0 ms for 20 fps\n\n");
+	fprintf(f, "%-16s %10s %8s %8s\n", "config", "ms", "fps", "rays");
+
+	for (int i = 0; i < BENCH_COUNT; i++) {
+		const RenderConfig *c = &g_bench[i].cfg;
+		const long rays = (long)(SCREEN_W / c->scale) *
+		                  (long)(SCREEN_H / c->scale) *
+		                  (long)(c->aa * c->aa);
+
+		fprintf(f, "%-16s %10.1f %8.2f %8ld\n",
+		        g_bench[i].name,
+		        g_bench[i].ms,
+		        g_bench[i].ms > 0.0 ? 1000.0 / g_bench[i].ms : 0.0,
+		        rays);
+	}
+
+	fclose(f);
+	status(BENCH_COUNT + 2, "Wrote %s", BENCH_REPORT_PATH);
+}
+
+static void run_benchmark(const Camera *cam)
+{
+	const RenderConfig saved = g_cfg;
+
+	printf("\x1b[13;1H\x1b[Jbenchmark -- B aborts\n");
+	present();
+
+	for (int i = 0; i < BENCH_COUNT; i++) {
+		hidScanInput();
+		if ((hidKeysDown() & KEY_B) || !aptMainLoop()) {
+			status(0, "Benchmark aborted at case %d/%d",
+			       i + 1, BENCH_COUNT);
+			g_cfg = saved;
+			return;
+		}
+
+		status(0, "Running %d/%d: %-16s", i + 1, BENCH_COUNT,
+		       g_bench[i].name);
+
+		g_cfg = g_bench[i].cfg;
+
+		/* Re-fetch every case: status() presents, which swaps the back
+		 * buffer, so a pointer cached across cases would be stale. */
+		u16 w = 0, h = 0;
+		u8 *fb = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, &w, &h);
+
+		TickCounter tc;
+		osTickCounterStart(&tc);
+		render_frame(fb, cam);
+		osTickCounterUpdate(&tc);
+
+		g_bench[i].ms = osTickCounterRead(&tc);
+	}
+
+	g_cfg = saved;
+
+	/* Results table, one row per case. */
+	status(0, "%-14s %8s %6s", "config", "ms", "fps");
+	for (int i = 0; i < BENCH_COUNT; i++) {
+		const double ms = g_bench[i].ms;
+		status(i + 1, "%-14s %8.1f %6.2f",
+		       g_bench[i].name, ms, ms > 0.0 ? 1000.0 / ms : 0.0);
+	}
+
+	write_bench_report();
+}
+
 /* -------------------------------------------------------------------- MAIN */
 
 int main(int argc, char **argv)
@@ -848,9 +1020,12 @@ int main(int argc, char **argv)
 	printf("3DS software ray tracer  v%s\n", APP_VERSION);
 	printf("%dx%d  %dx%d AA  %d bounces\n",
 	       SCREEN_W, SCREEN_H, AA, AA, MAX_DEPTH);
-	printf("\nSTART  exit\n");
-	printf("Y      check for updates -- hold it\n");
-	printf("       until the frame finishes\n");
+	printf("console: %s\n", is_new_3ds() ? "New 3DS" : "Old 3DS");
+	printf("\nSTART   exit\n");
+	printf("Y       check for updates\n");
+	printf("SELECT  run benchmark\n");
+	printf("(hold -- input is only read\n");
+	printf(" between frames)\n");
 
 	Camera cam;
 	camera_setup(&cam);
@@ -867,6 +1042,8 @@ int main(int argc, char **argv)
 			break;
 		if (pressed & KEY_Y)
 			run_update_check();
+		if (pressed & KEY_SELECT)
+			run_benchmark(&cam);
 
 		u16 fb_w = 0, fb_h = 0;
 		u8 *fb = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, &fb_w, &fb_h);
@@ -876,7 +1053,7 @@ int main(int argc, char **argv)
 		const u64 elapsed = osGetTime() - t_start;
 
 		frame++;
-		printf("\x1b[8;1Hframe %-6lu  %6llu ms  %5.2f fps",
+		printf("\x1b[11;1Hframe %-6lu  %6llu ms  %5.2f fps",
 		       (unsigned long)frame,
 		       (unsigned long long)elapsed,
 		       elapsed ? 1000.0 / (double)elapsed : 0.0);
