@@ -46,7 +46,7 @@
 /* Updater. APP_VERSION is compared against the tag of the latest GitHub
  * release -- bump it whenever a new release is cut, or the app will offer to
  * install a build it is already running. */
-#define APP_VERSION "1.0.3"
+#define APP_VERSION "1.0.4"
 #define UPDATE_LATEST_URL \
 	"https://github.com/stevenjc2009-byte/raytracer3ds/releases/latest"
 #define UPDATE_CIA_URL \
@@ -1304,6 +1304,30 @@ static void run_benchmark(const Camera *cam)
 	write_bench_report();
 }
 
+/*
+ * Line 2 of the bottom console: what is actually being rendered right now.
+ *
+ * Reprinted every frame rather than once at startup, because X can change it
+ * at any point and a one-shot print would silently go stale -- the screen
+ * would claim 400x240 while half-resolution blocks were going up. The absolute
+ * cursor position is why this cannot be called inline while the rest of the
+ * header is being printed: it would leave the cursor mid-line and the next
+ * header line would land on top of this one.
+ *
+ * The toggle only ever produces scale 1 or 2, so "full"/"half" is exhaustive
+ * for anything reachable from the live view. The dimensions are computed from
+ * the real scale either way, so they stay correct regardless.
+ */
+static void print_render_mode(void)
+{
+	const int scale = g_cfg.scale;
+
+	printf("\x1b[2;1H\x1b[K%dx%d %s  %dx%d AA  %d bounces",
+	       SCREEN_W / scale, SCREEN_H / scale,
+	       scale == 1 ? "full" : "half",
+	       g_cfg.aa, g_cfg.aa, g_cfg.depth);
+}
+
 /* -------------------------------------------------------------------- MAIN */
 
 int main(int argc, char **argv)
@@ -1325,8 +1349,7 @@ int main(int argc, char **argv)
 	 * clean render target. */
 	consoleInit(GFX_BOTTOM, NULL);
 	printf("3DS software ray tracer  v%s\n", APP_VERSION);
-	printf("%dx%d  %dx%d AA  %d bounces\n",
-	       SCREEN_W, SCREEN_H, AA, AA, MAX_DEPTH);
+	printf("\n");   /* line 2 is the live render mode; filled in below */
 	printf("console: %s   cores: %d\n",
 	       g_new3ds ? "New 3DS" : "Old 3DS", g_max_threads);
 
@@ -1340,11 +1363,17 @@ int main(int argc, char **argv)
 	else
 		printf("  syscore REFUSED 0x%08lX\n", (unsigned long)g_apt_rc);
 
+	/* Exactly five lines, ending on line 10: the frame readout, the cache
+	 * warning and status() all address lines 11, 12 and 13+ absolutely, so
+	 * a sixth line here would be overwritten by the first rendered frame.
+	 * The hold note was two lines before X needed one. */
 	printf("\nSTART   exit\n");
-	printf("Y       check for updates\n");
 	printf("SELECT  run benchmark\n");
-	printf("(hold -- input is only read\n");
-	printf(" between frames)\n");
+	printf("Y       check for updates\n");
+	printf("X       toggle half resolution\n");
+	printf("(hold: input is read between frames)\n");
+
+	print_render_mode();
 
 	Camera cam;
 	camera_setup(&cam);
@@ -1363,6 +1392,16 @@ int main(int argc, char **argv)
 			run_update_check();
 		if (pressed & KEY_SELECT)
 			run_benchmark(&cam);
+
+		/* Half resolution traces one ray per 2x2 block and writes the
+		 * block, so it still covers every pixel -- toggling back to
+		 * full leaves no stale half-res blocks behind. Safe to change
+		 * here because the workers are joined between frames and only
+		 * ever read g_cfg; nothing is mid-render at this point. */
+		if (pressed & KEY_X)
+			g_cfg.scale = (g_cfg.scale == 1) ? 2 : 1;
+
+		print_render_mode();
 
 		u16 fb_w = 0, fb_h = 0;
 		u8 *fb = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, &fb_w, &fb_h);

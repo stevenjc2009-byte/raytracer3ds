@@ -77,8 +77,9 @@ pixels.
 | Button | Action |
 | --- | --- |
 | START | Exit |
-| Y | Check GitHub for a newer release, and install it |
 | SELECT | Run the benchmark sweep |
+| Y | Check GitHub for a newer release, and install it |
+| X | Toggle half resolution (v1.0.4; see [Live half-resolution toggle](#live-half-resolution-toggle-v104)) |
 
 The bottom screen shows frame count, frame time in milliseconds, and fps.
 
@@ -317,6 +318,63 @@ Four changes, all in `source/main.c`, aimed at the ARM11 rather than the host:
   either the syscore percentage that was granted or
   `syscore REFUSED 0x........` with the real result code.
 
+## Live half-resolution toggle (v1.0.4)
+
+A single new control: pressing **X** in the live view toggles `g_cfg.scale`
+between 1 (full 400x240, a ray per pixel) and 2 (200x120 traced, each sample
+written as a 2x2 block). Nothing else changed — no rendering maths was
+touched.
+
+Why it exists: the
+[v1.0.2 hardware measurements](#hardware-measurements-v102-new-3ds) showed
+full resolution at 117.8 ms (8.49 fps) and half resolution *at full quality*
+at 31.0 ms (32.26 fps), which makes the resolution/quality trade the only
+remaining route to 20 fps. But there was no way to actually *look* at half
+resolution — `g_cfg.scale` was only ever set by the benchmark sweep, which
+restores it immediately. The toggle exists so the trade can be judged by eye
+rather than from a table.
+
+- **Applied between frames**, in the same place the other buttons are
+  handled. That is safe without any lock because the render threads are
+  joined before the loop reads input and the workers only ever read `g_cfg`
+  — nothing is mid-render at that point.
+- **Full coverage at half resolution.** `put_block` writes the full `scale`
+  x `scale` block, and 400 and 240 are both divisible by 2, so toggling back
+  to full leaves no stale half-res blocks on screen. Verified, not assumed:
+  rendering twice at scale 2 with two different framebuffer poison fills
+  (0x00 and 0xFF) produced identical output — 0 of 96000 pixels differ — and
+  the check was proven able to go red by deliberately skipping one interleave
+  slot, which produced exactly 50.0000% of pixels differing and a non-zero
+  exit.
+- **`print_render_mode()` prints every frame, not once at startup.** A
+  one-shot print would go stale the moment X is pressed and the screen would
+  claim 400x240 while half-resolution blocks were going up. It writes line 2
+  of the bottom console at an absolute cursor position (`\x1b[2;1H`), which is
+  why it cannot be called inline while the rest of the header is printed —
+  doing so would leave the cursor mid-line and the next header line would
+  land on top of it.
+- **The control list stays five lines, ending on line 10.** The frame
+  readout, the cache warning and `status()` address console lines 11, 12 and
+  13+ absolutely, so a sixth line would be overwritten by the first rendered
+  frame. The two-line "hold" note was condensed to one line to make room for
+  the X entry. The controls are now: START exit / SELECT run benchmark / Y
+  check for updates / X toggle half resolution.
+- **No rendering change.** The host harness (`scratchpad/hostcheck`, which
+  `#include`s the real `main.c`) shows full-resolution output bit-identical
+  to v1.0.3 — 0 pixels differing out of 96000, max abs channel diff 0 — on
+  both the `-O2` and the `-O3 -ffast-math` arms. Honest scope: this does not
+  exercise the toggle itself, since the harness has no input. On ARM, `trace`
+  is 633 instructions and `render_columns` 337, identical to v1.0.3; `.text`
+  grew from 126,856 to 127,720 bytes (+864 B), all of it UI strings and the
+  new helper — no cost in the render path.
+
+The toggle has never been pressed on hardware. Specifically unverified: that
+the bottom-screen console layout above is right — the line accounting is read
+off the code, not seen on a console — and that X is not swallowed by the
+"input is only sampled between frames" behaviour: at 118 ms per frame the
+button must be held briefly for the tap to register, exactly like the
+existing controls.
+
 ## Tunables
 
 All at the top of [`source/main.c`](source/main.c):
@@ -361,6 +419,7 @@ so a specific version can be installed rather than whatever is newest:
 | v1.0.1 | `v1.0.1` | `meta/qr-v1.0.1.png` |
 | v1.0.2 | `v1.0.2` | `meta/qr-v1.0.2.png` |
 | v1.0.3 | `v1.0.3` | `meta/qr-v1.0.3.png` |
+| v1.0.4 | `v1.0.4` | `meta/qr-v1.0.4.png` |
 
 ## Art
 
@@ -386,6 +445,17 @@ CIA build. Replace them and rebuild if you want something better.
   anywhere in the v1.0.2 benchmark sweep on that New 3DS — the first time
   `svcStoreProcessDataCache` had ever actually executed outside compilation,
   and it held up.
+- **v1.0.4's half-resolution toggle changes no rendering.** The host harness
+  shows full-resolution output bit-identical to v1.0.3 — 0 pixels differing
+  out of 96000, max abs channel diff 0 — on both the `-O2` and the
+  `-O3 -ffast-math` arms, and on ARM `trace` (633 instructions) and
+  `render_columns` (337) are unchanged from v1.0.3. See
+  [Live half-resolution toggle](#live-half-resolution-toggle-v104).
+- **Half-resolution coverage is complete.** Rendering twice at scale 2 with
+  two different framebuffer poison fills produced identical output — 0 of
+  96000 pixels differ — and the check was proven able to go red:
+  deliberately skipping one interleave slot at scale 2 produced exactly
+  50.0000% of pixels differing.
 
 **Not verified — these need hardware:**
 
@@ -400,6 +470,12 @@ CIA build. Replace them and rebuild if you want something better.
 - **How it looks.**
 - **The entire updater.** The HTTP request, the redirect parsing, the download,
   and the AM install have never been executed — only compiled.
+- **The v1.0.4 half-resolution toggle, on hardware.** X has never been pressed
+  on a console: the bottom-screen console layout is read off the code, not
+  seen on a console, and it is unverified that X is not swallowed by the
+  "input is only sampled between frames" behaviour — at 118 ms per frame the
+  button must be held briefly for the tap to register, exactly like the
+  existing controls.
 
 Ray/box normals, camera basis, reflection vectors, and recursion depth were
 hand-derived and check out, but that is reasoning, not a measurement.
